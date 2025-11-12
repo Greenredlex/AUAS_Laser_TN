@@ -9,7 +9,7 @@ from threading import Thread, Event
 from collections import deque
 
 # If needed, add bindings path
-# sys.path.append(r"C:\path\to\python_bindings")
+sys.path.append(r"C:\Users\BrightSky\Documents\PROJECTS\auas_inspection_engine\scenario_inspector\libs\python_bindings")
 
 try:
     import pyllt as llt
