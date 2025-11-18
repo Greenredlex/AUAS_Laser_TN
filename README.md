@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # AUAS laser gantry mapper
 
 This workspace now contains `gantry_scan_mapper.py`, a combined script that lets you
@@ -83,3 +84,6 @@ python gantrycontrollerbasic.py --mode move --xpos 100 --ypos 20 --zpos 30
 ```
 
 Use `--max-speed` to clamp the jog speed if you need gentler motion, e.g. `--max-speed 40`.
+=======
+Active code base to control a LaserLine scanner on a 3 axis gantry. Using realtime calculations to create a 3d heigh map of a object
+>>>>>>> 4af72cb18ba5113a6597ad35ebdd244816be7e08
