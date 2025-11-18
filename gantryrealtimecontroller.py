@@ -13,7 +13,7 @@ IP = "192.168.3.11"
 PORT = 3920
 
 # Jog parameters
-JOG_SPEED_STEP = 50.0     # percent of max per key press (held keys keep it applied)
+JOG_SPEED_STEP = 50.0     # percent of max per key press (held keys keep dwadseqeqit applied)
 JOG_UPDATE_HZ = 50        # 50 Hz jog updates
 JOG_DT = 1.0 / JOG_UPDATE_HZ
 
