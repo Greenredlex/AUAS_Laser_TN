@@ -10,7 +10,7 @@ Run this file to:
 - Convert each line into absolute (X, Y) surface points with a color-coded height
 - Watch the map fill in as you sweep the gantry across the target
 
-Dependencies: keyboard, numpy, matplotlib, pyllt (LLT.dll bindings), CRI libs.
+Dependencies: keyboard, numpy, pyqtgraph, pyllt (LLT.dll bindings), CRI libs.
 """
 
 from __future__ import annotations
@@ -25,10 +25,9 @@ from dataclasses import dataclass
 from typing import Optional, Tuple
 
 import keyboard
-import matplotlib.pyplot as plt
 import numpy as np
-from matplotlib.animation import FuncAnimation
-from matplotlib.colors import Normalize
+import pyqtgraph as pg
+from pyqtgraph.Qt import QtCore, QtWidgets
 
 # Project-specific libraries (adjust the paths if your workspace differs)
 sys.path.append(r"C:\Users\BrightSky\Documents\PROJECTS\auas_inspection_engine\scenario_inspector")
@@ -72,11 +71,14 @@ LASER_HEIGHT_AXIS = "Y"          # which Pose axis ("X", "Y" or "Z") tracks the 
 LASER_HEIGHT_SCALE = -1.0        # -1.0 because "cardpos gives Y in inverse"
 LASER_HEIGHT_OFFSET_MM = 0.0     # add a fixed offset to convert to absolute table height
 
-# Keep a finite history to avoid unbounded RAM usage
-MAX_POINTS_IN_MAP = 400_000
+# Keep a finite history to avoid unbounded RAM usage while allowing >400k points
+MAX_POINTS_IN_MAP = 2_000_000
 
-# Matplotlib refresh cadence (ms)
-PLOT_REFRESH_MS = 80
+# Visualisation tuning
+DISPLAY_POINT_BUDGET = 800_000    # limit per-frame sample sent to GPU for rendering
+PLOT_REFRESH_MS = 40              # GUI timer interval in ms
+AXIS_PADDING_MM = 15.0
+SCATTER_DIAMETER_PX = 4.0
 
 
 # ---------------------------------------------------------------------------
@@ -376,40 +378,67 @@ class GantryJogController:
         print("Gantry disconnected")
 
 
-class HeightMapAggregator:
-    """Thread-safe point cloud buffer feeding the live plot."""
+class PointRingBuffer:
+    """Thread-safe circular buffer that can be sampled without reallocations."""
 
-    def __init__(self, max_points: int = MAX_POINTS_IN_MAP):
-        self.max_points = max_points
+    def __init__(self, capacity: int = MAX_POINTS_IN_MAP):
+        self.capacity = capacity
         self._lock = threading.Lock()
-        self._x: list[float] = []
-        self._y: list[float] = []
-        self._h: list[float] = []
+        self._x = np.empty(capacity, dtype=np.float32)
+        self._y = np.empty(capacity, dtype=np.float32)
+        self._h = np.empty(capacity, dtype=np.float32)
+        self._head = 0
+        self._count = 0
         self._dirty = False
 
     def add_points(self, x_vals: np.ndarray, y_vals: np.ndarray, h_vals: np.ndarray) -> int:
-        if x_vals.size == 0:
+        n = int(x_vals.size)
+        if n == 0:
             return 0
+        if n > self.capacity:
+            # Keep only the newest samples if we overflow the buffer in one batch.
+            x_vals = x_vals[-self.capacity :]
+            y_vals = y_vals[-self.capacity :]
+            h_vals = h_vals[-self.capacity :]
+            n = self.capacity
         with self._lock:
-            overflow = (len(self._x) + x_vals.size) - self.max_points
-            if overflow > 0:
-                self._x = self._x[overflow:]
-                self._y = self._y[overflow:]
-                self._h = self._h[overflow:]
-            self._x.extend(x_vals.tolist())
-            self._y.extend(y_vals.tolist())
-            self._h.extend(h_vals.tolist())
+            first = min(n, self.capacity - self._head)
+            second = n - first
+            self._x[self._head : self._head + first] = x_vals[:first]
+            self._y[self._head : self._head + first] = y_vals[:first]
+            self._h[self._head : self._head + first] = h_vals[:first]
+            if second:
+                self._x[:second] = x_vals[first:]
+                self._y[:second] = y_vals[first:]
+                self._h[:second] = h_vals[first:]
+            self._head = (self._head + n) % self.capacity
+            self._count = min(self.capacity, self._count + n)
             self._dirty = True
-            return x_vals.size
+            return n
 
-    def snapshot(self) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def snapshot(
+        self, max_points: Optional[int] = DISPLAY_POINT_BUDGET
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         with self._lock:
             self._dirty = False
-            return (
-                np.asarray(self._x, dtype=np.float32),
-                np.asarray(self._y, dtype=np.float32),
-                np.asarray(self._h, dtype=np.float32),
-            )
+            count = self._count
+            if count == 0:
+                empty = np.empty(0, dtype=np.float32)
+                return empty, empty, empty
+            start = (self._head - count) % self.capacity
+            if start < self._head:
+                x = self._x[start : start + count].copy()
+                y = self._y[start : start + count].copy()
+                h = self._h[start : start + count].copy()
+            else:
+                x = np.concatenate((self._x[start:], self._x[: self._head])).copy()
+                y = np.concatenate((self._y[start:], self._y[: self._head])).copy()
+                h = np.concatenate((self._h[start:], self._h[: self._head])).copy()
+
+        if max_points and count > max_points:
+            idx = np.linspace(0, count - 1, num=max_points, dtype=np.int32)
+            return x[idx], y[idx], h[idx]
+        return x, y, h
 
     def has_fresh_data(self) -> bool:
         with self._lock:
@@ -417,53 +446,106 @@ class HeightMapAggregator:
 
     def point_count(self) -> int:
         with self._lock:
-            return len(self._x)
+            return self._count
 
 
-class LiveHeightMapPlotter:
-    def __init__(self, aggregator: HeightMapAggregator):
+class LiveHeightMapPlotter(QtWidgets.QMainWindow):
+    """PyQtGraph-based scatter renderer capable of hundreds of thousands of points."""
+
+    def __init__(self, aggregator: PointRingBuffer, stop_evt: threading.Event):
+        app = QtWidgets.QApplication.instance()
+        if app is None:
+            app = QtWidgets.QApplication(sys.argv)
+        self.app = app
+        super().__init__()
         self.aggregator = aggregator
-        self.fig, self.ax = plt.subplots(figsize=(8, 6), facecolor="white")
-        self.scatter = self.ax.scatter([], [], c=[], cmap="viridis", s=6)
-        self.colorbar = self.fig.colorbar(self.scatter, ax=self.ax, label="Height (mm)")
-        self.ax.set_xlabel("Gantry X (mm)")
-        self.ax.set_ylabel("Gantry Y (mm)")
-        self.ax.set_title("Live laser height map (top view)")
-        self.ax.set_aspect("equal", adjustable="box")
-        self.norm = Normalize(vmin=None, vmax=None)
+        self.stop_evt = stop_evt
+        pg.setConfigOptions(useOpenGL=True, antialias=False)
 
-    def init(self):
-        self.scatter.set_offsets(np.empty((0, 2)))
-        self.scatter.set_array(np.array([]))
-        return (self.scatter,)
+        self.setWindowTitle("Live laser height map (top view)")
+        self.resize(1200, 800)
 
-    def update(self, _frame):
+        self.layout = pg.GraphicsLayoutWidget(show=False)
+        self.setCentralWidget(self.layout)
+
+        self.plot = self.layout.addPlot(row=0, col=0)
+        self.plot.setLabel("bottom", "Gantry X", units="mm")
+        self.plot.setLabel("left", "Gantry Y", units="mm")
+        self.plot.showGrid(x=True, y=True, alpha=0.2)
+        self.plot.setAspectLocked(True, ratio=1)
+
+        self.scatter = pg.ScatterPlotItem(pen=None, size=SCATTER_DIAMETER_PX, pxMode=True)
+        self.plot.addItem(self.scatter)
+
+        self.legend = pg.LabelItem(justify="left")
+        self.layout.addItem(self.legend, row=1, col=0)
+
+        try:
+            self.cmap = pg.colormap.get("viridis")
+        except AttributeError:  # pragma: no cover - fallback for older pyqtgraph
+            self.cmap = pg.ColorMap(
+                pos=np.linspace(0.0, 1.0, num=4, dtype=float),
+                color=["#440154", "#31688e", "#35b779", "#fde725"],
+            )
+        self.timer = QtCore.QTimer()
+        self.timer.timeout.connect(self._refresh_plot)
+
+    def start(self):
+        self.show()
+        self.timer.start(PLOT_REFRESH_MS)
+        try:
+            self.app.exec()
+        finally:
+            self.timer.stop()
+
+    def closeEvent(self, event):  # noqa: N802 - Qt signature
+        self.stop_evt.set()
+        self.timer.stop()
+        QtCore.QTimer.singleShot(0, self.app.quit)
+        return super().closeEvent(event)
+
+    def _refresh_plot(self):
+        if self.stop_evt.is_set():
+            if self.isVisible():
+                self.close()
+            return
         if not self.aggregator.has_fresh_data():
-            return (self.scatter,)
-        x_vals, y_vals, h_vals = self.aggregator.snapshot()
+            return
+        x_vals, y_vals, h_vals = self.aggregator.snapshot(max_points=DISPLAY_POINT_BUDGET)
         if x_vals.size == 0:
-            return (self.scatter,)
-        offsets = np.column_stack((x_vals, y_vals))
-        self.scatter.set_offsets(offsets)
-        self.scatter.set_array(h_vals)
-        # auto axis + color limits with a padding margin
-        pad = 10.0
-        self.ax.set_xlim(float(np.min(x_vals) - pad), float(np.max(x_vals) + pad))
-        self.ax.set_ylim(float(np.min(y_vals) - pad), float(np.max(y_vals) + pad))
+            self.scatter.clear()
+            self.legend.setText("Awaiting data…")
+            return
+
         finite = np.isfinite(h_vals)
-        if np.any(finite):
-            self.norm.vmin = float(np.nanmin(h_vals[finite]))
-            self.norm.vmax = float(np.nanmax(h_vals[finite]))
-            self.scatter.set_norm(self.norm)
-            self.colorbar.update_normal(self.scatter)
-        return (self.scatter,)
+        if not finite.any():
+            return
+
+        h_valid = h_vals[finite]
+        vmin = float(np.nanmin(h_valid))
+        vmax = float(np.nanmax(h_valid))
+        span = max(vmax - vmin, 1e-6)
+        norm = np.clip((h_vals - vmin) / span, 0.0, 1.0)
+        if hasattr(np, "nan_to_num"):
+            norm = np.nan_to_num(norm, nan=0.0, posinf=1.0, neginf=0.0)
+        colors = self.cmap.map(norm, mode="qcolor")
+
+        self.scatter.setData(x=x_vals, y=y_vals, brush=colors)
+        self.plot.setXRange(float(np.min(x_vals) - AXIS_PADDING_MM), float(np.max(x_vals) + AXIS_PADDING_MM), padding=0)
+        self.plot.setYRange(float(np.min(y_vals) - AXIS_PADDING_MM), float(np.max(y_vals) + AXIS_PADDING_MM), padding=0)
+
+        self.legend.setText(
+            f"Points shown: {x_vals.size:,} / stored {self.aggregator.point_count():,} | "
+            f"Height span: {vmin:.1f} … {vmax:.1f} mm",
+            size="12pt",
+        )
 
 
 class GantryLaserMapper:
     def __init__(self):
         self.scanner = LaserScanner()
         self.gantry = GantryJogController()
-        self.aggregator = HeightMapAggregator()
+        self.aggregator = PointRingBuffer()
         self.stop_evt = threading.Event()
         self.profile_thread: Optional[threading.Thread] = None
         self._last_status_print = 0.0
@@ -479,16 +561,9 @@ class GantryLaserMapper:
         self.profile_thread = threading.Thread(target=self._profile_loop, daemon=True)
         self.profile_thread.start()
 
-        plotter = LiveHeightMapPlotter(self.aggregator)
-        ani = FuncAnimation(
-            plotter.fig,
-            plotter.update,
-            init_func=plotter.init,
-            interval=PLOT_REFRESH_MS,
-            blit=True,
-        )
+        plotter = LiveHeightMapPlotter(self.aggregator, self.stop_evt)
         try:
-            plt.show()
+            plotter.start()
         finally:
             self.stop_evt.set()
             self._cleanup()
@@ -498,6 +573,9 @@ class GantryLaserMapper:
             return
         with transfer_profiles_guard(self.scanner.hLLT):
             while not self.stop_evt.is_set():
+                if self.gantry.stop_evt.is_set():
+                    self.stop_evt.set()
+                    break
                 pose = self.gantry.get_pose()
                 if pose is None:
                     time.sleep(0.01)
