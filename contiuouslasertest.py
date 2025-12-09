@@ -6,6 +6,7 @@ import sys
 import time
 import ctypes as ct
 import numpy as np
+import scipy as sp
 import signal
 from contextlib import contextmanager
 
@@ -134,11 +135,11 @@ def setup_scanner(hLLT) -> tuple:
 # Acquisition/plotting
 # ------------------------
 class LivePlot:
-    def __init__(self, hLLT, scanner_type, resolution, mode="scatter"):
+    def __init__(self, hLLT, scanner_type, resolution, mode="single"):
         self.hLLT = hLLT
         self.scanner_type = scanner_type
         self.resolution = int(resolution)
-        self.mode = mode  # "single", "scatter" or "waterfall"
+        self.mode = mode  # "single" or "waterfall"
 
         # Buffers
         self.profile_buffer = (ct.c_ubyte * (self.resolution * 64))()
@@ -159,6 +160,10 @@ class LivePlot:
             self.ax_single.set_xlabel("x (mm)")
             self.ax_single.set_ylabel("z (mm)")
             (self.line_single,) = self.ax_single.plot([], [], "g-", lw=1)
+            # Max and min lines
+            (self.line_max,) = self.ax_single.plot([], [], "r--", lw=1, label="max")
+            (self.line_min,) = self.ax_single.plot([], [], "b--", lw=1, label="min")
+            self.ax_single.legend(loc="upper right")
             # Ensure tick labels show plain mm without scientific offsets
             for axis in (self.ax_single.xaxis, self.ax_single.yaxis):
                 fmt = ScalarFormatter(useOffset=False)
@@ -169,28 +174,8 @@ class LivePlot:
             self.global_z_max = -np.inf
             self.global_x_min = np.inf
             self.global_x_max = -np.inf
-        elif self.mode == "scatter":
-            self.fig = plt.figure(figsize=(7, 6), facecolor="white")
-            self.ax1 = self.fig.add_subplot(211)
-            self.ax2 = self.fig.add_subplot(212)
-
-            self.ax1.grid(True)
-            self.ax2.grid(True)
-            self.ax1.set_ylabel("z")
-            self.ax2.set_xlabel("x")
-            # Show millimetres for the second subplot instead of intensity
-            self.ax2.set_ylabel("z (mm)")
-
-            # Set to typical values; adjust to your scene
-            self.ax1.set_xlim(-30, 30)
-            self.ax1.set_ylim(25, 135)
-            # Make the second subplot show the same sensible z-range (mm)
-            self.ax2.set_xlim(-60, 60)
-            self.ax2.set_ylim(25, 135)
-
-            (self.line_profile,) = self.ax1.plot([], [], "g.", ms=2)
-            # Plot z (mm) on the second axes instead of intensity
-            (self.line_z_mm,) = self.ax2.plot([], [], "r-", ms=2, lw=1)
+            # Rotation angle in degrees
+            self.rotation_angle = 0.0
 
         elif self.mode == "waterfall":
             from collections import deque
@@ -213,7 +198,7 @@ class LivePlot:
             cbar = self.fig.colorbar(self.im, ax=self.ax)
             cbar.set_label("z (mm)")
         else:
-            raise ValueError("mode must be 'single', 'scatter' or 'waterfall'")
+            raise ValueError("mode must be 'single' or 'waterfall'")
 
         self._frames_seen = 0
         # Dynamic range calibration placeholders (will be filled by calibrate_range)
@@ -257,13 +242,8 @@ class LivePlot:
         self.z_min_cal = z_lo
         self.z_max_cal = z_hi
         # Apply to existing axes
-        if self.mode == "scatter":
-            try:
-                self.ax1.set_ylim(z_lo, z_hi)
-                self.ax2.set_ylim(z_lo, z_hi)
-            except Exception:
-                pass
-        elif self.mode == "waterfall":
+
+        if self.mode == "waterfall":
             try:
                 self.im.set_clim(z_lo, z_hi)
             except Exception:
@@ -334,14 +314,34 @@ class LivePlot:
     def init(self):
         if self.mode == "single":
             self.line_single.set_data([], [])
-            return [self.line_single]
-        if self.mode == "scatter":
-            self.line_profile.set_data([], [])
-            self.line_z_mm.set_data([], [])
-            return self.line_profile, self.line_z_mm
+            self.line_max.set_data([], [])
+            self.line_min.set_data([], [])
+            return [self.line_single, self.line_max, self.line_min]
         else:
             self.im.set_data(np.zeros((self.rows, self.resolution), dtype=np.float32))
             return [self.im]
+
+    def rotate_points(self, x, z, angle_deg):
+        """Rotate points around their center by angle_deg (in degrees)."""
+        if x.size == 0 or z.size == 0:
+            return x, z
+        # Center of points
+        x_center = np.mean(x)
+        z_center = np.mean(z)
+        # Convert to radians and apply rotation matrix
+        angle_rad = np.radians(angle_deg)
+        cos_a = np.cos(angle_rad)
+        sin_a = np.sin(angle_rad)
+        # Translate to origin
+        x_trans = x - x_center
+        z_trans = z - z_center
+        # Rotate
+        x_rot = x_trans * cos_a - z_trans * sin_a
+        z_rot = x_trans * sin_a + z_trans * cos_a
+        # Translate back
+        x_rotated = x_rot + x_center
+        z_rotated = z_rot + z_center
+        return x_rotated, z_rotated
 
     def update(self, _):
         data = self.grab()
@@ -359,7 +359,58 @@ class LivePlot:
             valid = np.isfinite(z_np)
             xv = x_np[valid]
             zv = z_np[valid]
-            self.line_single.set_data(xv, zv)
+
+            # Apply rotation if angle is non-zero
+            if self.rotation_angle != 0.0:
+                xv, zv = self.rotate_points(xv, zv, self.rotation_angle)
+
+            # Default to raw values; attempt smoothing only when sensible
+            zv_spl = zv
+            if xv.size > 1:
+                # Ensure x is strictly ascending for spline: sort by x
+                order = np.argsort(xv)
+                xv_sorted = xv[order]
+                zv_sorted = zv[order]
+
+                # Handle duplicate x by averaging z values for the same x
+                uniq_x, inv_idx = np.unique(xv_sorted, return_inverse=True)
+                if uniq_x.size >= 2:
+                    if uniq_x.size != xv_sorted.size:
+                        zv_uniq = np.zeros(uniq_x.size, dtype=zv_sorted.dtype)
+                        counts = np.zeros(uniq_x.size, dtype=np.int64)
+                        for i, ui in enumerate(inv_idx):
+                            zv_uniq[ui] += zv_sorted[i]
+                            counts[ui] += 1
+                        zv_uniq /= counts
+                        xv_for_spline = uniq_x
+                        zv_for_spline = zv_uniq
+                    else:
+                        xv_for_spline = xv_sorted
+                        zv_for_spline = zv_sorted
+
+                    try:
+                        spline = sp.interpolate.make_smoothing_spline(xv_for_spline, zv_for_spline, lam=100)
+                        # evaluate spline on the sorted x values, then map back to original order
+                        zv_spl_sorted = spline(xv_sorted)
+                        zv_spl = np.empty_like(zv)
+                        zv_spl[order] = zv_spl_sorted
+                    except Exception:
+                        # Spline failed for some reason; keep raw values
+                        zv_spl = zv
+                else:
+                    # Not enough unique x values for a spline
+                    zv_spl = zv
+
+            self.line_single.set_data(xv, zv_spl)
+
+            # Calculate and draw max/min horizontal lines for this frame
+            if zv_spl.size > 0:
+                z_max = float(np.nanmax(zv_spl))
+                z_min = float(np.nanmin(zv_spl))
+                x_range = [xv.min(), xv.max()]
+                self.line_max.set_data(x_range, [z_max, z_max])
+                self.line_min.set_data(x_range, [z_min, z_min])
+
             # Expand global ranges and set limits with margin
             if xv.size and zv.size:
                 self.global_x_min = min(self.global_x_min, float(np.nanmin(xv)))
@@ -373,26 +424,7 @@ class LivePlot:
                 zm = z_span * 0.05
                 self.ax_single.set_xlim(self.global_x_min - xm, self.global_x_max + xm)
                 self.ax_single.set_ylim(self.global_z_min - zm, self.global_z_max + zm)
-            return [self.line_single]
-        if self.mode == "scatter":
-            # Validity: finite z, intensity >0, z>0; drop zeros (nulls) & outside calibrated span if available
-            valid = np.isfinite(z_np)
-            # If a calibration window exists, prefer it, but be ready to recalibrate if too many points fall outside
-            if self.z_min_cal is not None and self.z_max_cal is not None:
-                in_win = (z_np >= self.z_min_cal) & (z_np <= self.z_max_cal)
-                # If more than 40% are outside, trigger recalibration (scene moved)
-                frac_out = 1.0 - float(np.count_nonzero(in_win)) / max(1, z_np.size)
-                if frac_out > 0.4 and self._frames_seen % 10 == 0:
-                    self.calibrate_range(samples=15)
-                valid &= in_win
-            xv = x_np[valid]
-            zv = z_np[valid]
-            self.line_profile.set_data(xv, zv)
-            self.line_z_mm.set_data(xv, zv)
-            # If not calibrated yet, attempt once after a few frames
-            if self.z_min_cal is None and self._frames_seen == 10:
-                self.calibrate_range()
-            return self.line_profile, self.line_z_mm
+            return [self.line_single, self.line_max, self.line_min]
         else:
             # waterfall (z in mm)
             # Replace invalid or out-of-range with NaN for better colour scaling
@@ -447,6 +479,19 @@ def run(mode="single", interval_ms=30, timeout_first_frame=5.0):
                 interval=interval_ms,
                 blit=True,
             )
+
+            # Keyboard handler for rotation control
+            def on_key(event):
+                if event.key == 'left':
+                    # Rotate left (counter-clockwise) by 0.1 degrees
+                    live.rotation_angle -= 0.1
+                    print(f"Rotation angle: {live.rotation_angle:.1f}°")
+                elif event.key == 'right':
+                    # Rotate right (clockwise) by 0.1 degrees
+                    live.rotation_angle += 0.1
+                    print(f"Rotation angle: {live.rotation_angle:.1f}°")
+
+            live.fig.canvas.mpl_connect('key_press_event', on_key)
             plt.show()
 
     finally:
