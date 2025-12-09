@@ -154,21 +154,34 @@ class LivePlot:
 
         # Matplotlib
         if self.mode == "single":
+            # Increase font sizes / linewidths for PPT export
+            plt.rcParams.update({
+            "font.size": 18,
+            "axes.labelsize": 20,
+            "axes.titlesize": 22,
+            "xtick.labelsize": 18,
+            "ytick.labelsize": 18,
+            "legend.fontsize": 18,
+            "lines.linewidth": 2,
+            })
+
             # Single realtime plot: x vs z with a full-range y-axis (no calibration)
-            self.fig, self.ax_single = plt.subplots(figsize=(7, 5), facecolor="white")
+            self.fig, self.ax_single = plt.subplots(figsize=(10, 6), facecolor="white")
             self.ax_single.grid(True)
-            self.ax_single.set_xlabel("x (mm)")
-            self.ax_single.set_ylabel("z (mm)")
-            (self.line_single,) = self.ax_single.plot([], [], "g-", lw=1)
-            # Max and min lines
-            (self.line_max,) = self.ax_single.plot([], [], "r--", lw=1, label="max")
-            (self.line_min,) = self.ax_single.plot([], [], "b--", lw=1, label="min")
-            self.ax_single.legend(loc="upper right")
+            self.ax_single.set_xlabel("x (mm)", fontsize=20)
+            self.ax_single.set_ylabel("z (mm)", fontsize=20)
+            (self.line_single,) = self.ax_single.plot([], [], "g-", lw=2)
+            # Max and min lines (thicker for visibility)
+            (self.line_max,) = self.ax_single.plot([], [], "r--", lw=2, label="max")
+            (self.line_min,) = self.ax_single.plot([], [], "b--", lw=2, label="min")
+            self.ax_single.legend(loc="upper right", fontsize=18)
             # Ensure tick labels show plain mm without scientific offsets
             for axis in (self.ax_single.xaxis, self.ax_single.yaxis):
                 fmt = ScalarFormatter(useOffset=False)
                 fmt.set_scientific(False)
                 axis.set_major_formatter(fmt)
+            # Larger tick label rendering
+            self.ax_single.tick_params(axis="both", which="major", labelsize=18)
             # Track global min/max encountered to avoid jittery autoscale
             self.global_z_min = np.inf
             self.global_z_max = -np.inf
