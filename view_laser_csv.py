@@ -183,13 +183,13 @@ def view_csv(filename):
         z_span = 0
         if len(actual_z) > 0:
             z_span = np.max(actual_z) - np.min(actual_z)
-            
+            print(np.max(actual_z))
         info_text.set_text(
             f"Frame: {row['frame_num']}\n"
             f"Robot X: {robot_x_arr[frame_idx]:.3f}\n"
             f"Robot Y: {robot_y_arr[frame_idx]:.3f}\n"
             f"Robot Z: {robot_z_arr[frame_idx]:.3f}\n"
-            f"Profile Z Span: {z_span:.2f} mm"
+            f"Profile Z Span: {z_span} mm"
         )
         
         return line_raw, line_smooth, info_text, line_robot_path, point_robot_curr
