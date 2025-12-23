@@ -17,6 +17,7 @@ except ImportError:
 
 def get_latest_csv():
     list_of_files = glob.glob('scan_data_*.csv') 
+    list_of_files += glob.glob('Corrosie_meetingen/scan_data_*.csv')
     if not list_of_files:
         return None
     return max(list_of_files, key=os.path.getctime)

@@ -9,7 +9,8 @@ import glob
 import os
 
 def get_latest_csv():
-    list_of_files = glob.glob('scan_data_*.csv') 
+    list_of_files = glob.glob('scan_data_*.csv')
+    list_of_files += glob.glob('Corrosie_meetingen/scan_data_*.csv')
     if not list_of_files:
         return None
     return max(list_of_files, key=os.path.getctime)
@@ -183,7 +184,7 @@ def view_csv(filename):
         z_span = 0
         if len(actual_z) > 0:
             z_span = np.max(actual_z) - np.min(actual_z)
-            print(np.max(actual_z))
+            #print(np.max(actual_z))
         info_text.set_text(
             f"Frame: {row['frame_num']}\n"
             f"Robot X: {robot_x_arr[frame_idx]:.3f}\n"
